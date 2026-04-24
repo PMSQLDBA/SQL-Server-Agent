@@ -1,0 +1,222 @@
+Technical SOP: SQL Job Monitoring & Reporting
+
+Procedure Name: USP_SQL_Job_Run_Audit_And_Email
+
+Description: Automates the tracking, logging, and email notification of SQL Server Agent job statuses.
+==================
+1. Objective
+==================
+To provide a daily automated report of all SQL Agent jobs, highlighting successes and failures in a single HTML email to ensure system reliability and quick troubleshooting.
+
+==================
+2. Workflow Logic
+=================
+The procedure follows a four-step automated cycle:
+1.  Cleanup: Deletes any audit data previously logged for "Today" to prevent duplicate entries.
+2.  Data Capture: Scans `msdb` system tables to find the "most recent" execution status for every job.
+3.  Audit Logging: Saves these results into the "Job_Run_Status_Audit" table for historical tracking.
+4.  Notification: Generates an HTML table where FAILED jobs are colored Red and SUCCEEDED jobs are Green**, then sends it via Database Mail.
+
+==================
+3. Key Components
+==================
+Audit Table: dbo.Job_Run_Status_Audit — Stores the job name, run time, duration, and status.
+Mail Profile: Uses the "DBAlerts" profile.
+Sorting: The email automatically groups failures at the top of the list for immediate visibility.
+
+
+CREATE TABLE [dbo].[Job_Run_Status_Audit](
+	[AuditID] [int] IDENTITY(1,1) NOT NULL,
+	[SerialNo] [int] NOT NULL,
+	[JobName] [varchar](200) NOT NULL,
+	[RunDateTime] [datetime] NULL,
+	[RunDuration] [varchar](20) NULL,
+	[JobStatus] [varchar](20) NULL,
+	[AuditDate] [datetime] NOT NULL,
+PRIMARY KEY CLUSTERED 
+(
+	[AuditID] ASC
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, 
+ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+) ON [PRIMARY]
+GO
+ALTER TABLE [dbo].[Job_Run_Status_Audit] ADD  DEFAULT (getdate()) FOR [AuditDate]
+
+==============================
+4. Configuration & Maintenance
+==============================
+ How to update recipients:
+Locate the "EXEC msdb.dbo.sp_send_dbmail" section at the bottom of the script and modify the @recipients string:
+> @recipients = 'yourname@example.com; team@example.com'
+
+ How to exclude specific jobs:
+Inside the "JobHistory" CTE, there is a commented-out "WHERE" clause. To hide specific jobs (like backups or cleanups) from the report:
+1.  Uncomment the "AND j.name NOT IN (...)" block.
+2.  Add the exact names of the jobs you wish to ignore.
+
+===================
+5. Troubleshooting
+==================
+Report is empty: Ensure jobs have actually run today and that the "msdb" history hasn't been purged.
+Email not sending:  Run "SELECT * FROM msdb.dbo.sysmail_faileditems" to check for mail server errors.
+Status says 'Unknown':** This occurs if a job has been created but has no execution history yet.
+
+=============
+6. Execution
+============
+Scheduled: Set to run via SQL Agent Job (e.g., every morning at 8:00 AM).
+Manual: Run "EXEC [dbo].[USP_SQL_Job_Run_Audit_And_Email]" in SSMS.
+
+===========================================================================================
+--Stored Procedure
+
+create or alter PROCEDURE [dbo].[USP_SQL_Job_Run_Audit_And_Email]
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @Today DATE = CAST(GETDATE() AS DATE);
+    --------------------------------------------------
+    -- STEP 0: REMOVE TODAY'S OLD DATA
+    --------------------------------------------------
+    DELETE FROM dbo.Job_Run_Status_Audit
+    WHERE CAST(AuditDate AS DATE) = @Today;
+    --------------------------------------------------
+    -- STEP 1: Capture Latest Job Status (Succeeded & Failed)
+    --------------------------------------------------
+    ;WITH JobHistory AS
+    (
+        SELECT
+            j.job_id,
+            j.name AS JobName,
+            h.run_date,
+            h.run_time,
+            h.run_duration,
+            h.run_status,
+            ROW_NUMBER() OVER (
+                PARTITION BY j.job_id
+                ORDER BY h.run_date DESC, h.run_time DESC
+            ) AS rn
+        FROM msdb.dbo.sysjobs j
+        LEFT JOIN msdb.dbo.sysjobhistory h
+            ON j.job_id = h.job_id
+        WHERE h.step_id = 0
+   --     AND j.name NOT IN (                --Enable this if you want to ignore any job by inserting job names inplace of Job-1, Job-2
+   --         'Job-1',
+   --         'Job-2',
+   --     )
+    ),
+    FinalData AS
+    (
+        SELECT
+            ROW_NUMBER() OVER (ORDER BY LTRIM(RTRIM(JobName))) AS SerialNo,
+            JobName,
+
+            CASE 
+                WHEN run_date IS NOT NULL AND run_time IS NOT NULL THEN
+                CONVERT(DATETIME,
+                    STUFF(STUFF(CAST(run_date AS CHAR(8)),5,0,'-'),8,0,'-') + ' ' +
+                    STUFF(STUFF(RIGHT('000000' + CAST(run_time AS VARCHAR(6)),6),3,0,':'),6,0,':')
+                )
+            END AS RunDateTime,
+
+            CASE 
+                WHEN run_duration IS NOT NULL THEN
+                STUFF(STUFF(RIGHT('000000' + CAST(run_duration AS VARCHAR(6)),6),3,0,':'),6,0,':')
+            END AS RunDuration,
+
+            CASE run_status
+                WHEN 0 THEN 'FAILED'
+                WHEN 1 THEN 'SUCCEEDED'
+                WHEN 2 THEN 'RETRY'
+                WHEN 3 THEN 'CANCELLED'
+                WHEN 4 THEN 'IN PROGRESS'
+                ELSE 'UNKNOWN'
+            END AS JobStatus,
+
+            GETDATE() AS AuditDate
+        FROM JobHistory
+        WHERE rn = 1
+    )
+
+    INSERT INTO dbo.Job_Run_Status_Audit
+    (
+        SerialNo,
+        JobName,
+        RunDateTime,
+        RunDuration,
+        JobStatus,
+        AuditDate
+    )
+    SELECT * FROM FinalData;
+
+    --------------------------------------------------
+    -- STEP 2: BUILD EMAIL CONTENT FOR ALL JOBS
+    --------------------------------------------------
+    DECLARE @body NVARCHAR(MAX) = '';
+    DECLARE @rows NVARCHAR(MAX) = '';
+
+    -- Capture Succeeded AND Failed jobs
+    SELECT @rows =
+    (
+        SELECT 
+            '<tr>' +
+            '<td>' + CAST(SerialNo AS VARCHAR) + '</td>' +
+            '<td style="text-align:left;">' + ISNULL(JobName,'') + '</td>' +
+            '<td>' + ISNULL(CONVERT(VARCHAR, RunDateTime, 120),'') + '</td>' +
+            '<td>' + ISNULL(RunDuration,'') + '</td>' +
+            '<td style="font-weight:bold; color:' + 
+                CASE WHEN JobStatus = 'FAILED' THEN 'red' ELSE 'green' END + ';">' + 
+                ISNULL(JobStatus,'') + 
+            '</td>' +
+            '</tr>'
+        FROM dbo.Job_Run_Status_Audit
+        WHERE CAST(AuditDate AS DATE) = @Today
+        ORDER BY JobStatus ASC, JobName ASC  -- Groups failures at the top
+        FOR XML PATH(''), TYPE
+    ).value('.', 'NVARCHAR(MAX)');
+
+    --------------------------------------------------
+    -- STEP 3: CONSTRUCT FINAL HTML & SEND
+    --------------------------------------------------
+    -- We removed the IF (@FailCount > 0) so the report always sends
+    --------------------------------------------------
+    -- STEP 3: CONSTRUCT FINAL HTML & SEND
+    --------------------------------------------------
+    SET @body =
+    '<html>
+    <head>
+    <style>
+        /* Change width to auto or a fixed px to stop the table from stretching too far */
+        table { border-collapse: collapse; font-family: Arial; font-size: 12px; width: auto; min-width: 600px; }
+        th { background-color: #2F75B5; color: white; padding: 8px; white-space: nowrap; }
+        td { border: 1px solid #ddd; padding: 6px; text-align: center; }
+        .header { font-size: 18px; font-weight: bold; margin-bottom: 10px; }
+    </style>
+    </head>
+    <body>
+
+    <div class="header">Daily SQL Job Status Report - ' + CONVERT(VARCHAR, GETDATE(), 106) + '</div>
+
+    <table>
+        <tr>
+            <th style="width: 50px;">Sr No</th>
+            <th style="text-align:left; width: 300px;">Job Name</th> 
+            <th style="width: 150px;">Run Date Time</th>
+            <th style="width: 80px;">Duration</th>
+            <th style="width: 100px;">Status</th>
+        </tr>' 
+        + ISNULL(@rows, '<tr><td colspan="5">No job history found for today.</td></tr>') +
+    '</table>
+
+    <br>Regards,<br>DBA Team
+    </body>
+    </html>';
+
+    EXEC msdb.dbo.sp_send_dbmail
+        @profile_name = 'DBAlerts',
+        @recipients = 'praveensqldba12@gmail.com',
+        @subject = 'SQL Jobs Execution Report',
+        @body = @body,
+        @body_format = 'HTML';
+
+END
